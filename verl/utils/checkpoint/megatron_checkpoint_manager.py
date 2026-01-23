@@ -26,6 +26,8 @@ import torch.distributed
 from megatron.core import mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+
 from ray.util.state import api
 from transformers import GenerationConfig
 
@@ -553,7 +555,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 transformer_config_dict = asdict(self.transformer_config)
                 for k in backup:
                     setattr(self.transformer_config, k, backup[k])
-                to_convert_types = {torch.dtype: str, AttnBackend: str}
+                to_convert_types = {torch.dtype: str, AttnBackend: str, PipelineParallelLayerLayout: str}
                 ignore_types = [Callable]
                 pop_keys = []
                 for key, value in transformer_config_dict.items():
