@@ -257,12 +257,20 @@ class FSDPEngineConfig(EngineConfig):
     entropy_from_logits_with_chunking: bool = False
     use_torch_compile: bool = True
     entropy_checkpointing: bool = False
+    enable_tree_training: bool = False
+    tree_max_tokens_per_tree: Optional[int] = None
     strategy: str = "fsdp"
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
 
     def __post_init__(self):
         super().__post_init__()
         assert self.strategy in ["fsdp", "fsdp2"], f"strategy {self.strategy} not supported"
+        if self.enable_tree_training:
+            assert self.tree_max_tokens_per_tree is not None and self.tree_max_tokens_per_tree > 0, (
+                "tree_max_tokens_per_tree must be a positive integer when enable_tree_training is True"
+            )
+            if self.ulysses_sequence_parallel_size > 1:
+                raise ValueError("Tree training currently cannot be enabled with ulysses_sequence_parallel_size > 1.")
 
 
 @dataclass

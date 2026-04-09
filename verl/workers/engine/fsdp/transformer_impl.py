@@ -289,6 +289,11 @@ class FSDPEngine(BaseEngine):
                 fused_kernels_backend=fused_kernels_backend,
             )
 
+            if self.engine_config.enable_tree_training:
+                from verl.models.tree_attn.module_fsdp import patch_fsdp_for_tree_training
+
+                patch_fsdp_for_tree_training(enable=True)
+
             # some parameters may not in torch_dtype
             module.to(torch_dtype)
 
@@ -1221,6 +1226,210 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_output["sum_pi_squared"] = sum_pi_squared
 
         return model_output
+
+    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
+        if not self.engine_config.enable_tree_training:
+            return super().forward_backward_batch(data, loss_function, forward_only)
+
+        return self._forward_backward_batch_tree(data, loss_function, forward_only)
+
+    def _forward_backward_batch_tree(
+        self, data: TensorDict, loss_function: Callable, forward_only=False
+    ) -> list[TensorDict]:
+        from verl.models.tree_attn.functional import gather_packed_tree_logprobs_entropy
+        from verl.models.tree_attn.tree import TreeMicroBatchItem, build_packed_tree_batch, build_tree_attn_kwargs
+
+        tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
+
+        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+        torch.distributed.all_reduce(
+            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+        )
+        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+        tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+
+        input_ids_tensor = data["input_ids"]
+        attention_mask_tensor = data["attention_mask"]
+        if hasattr(input_ids_tensor, "values"):
+            batch_size = input_ids_tensor.size(0)
+            offsets = input_ids_tensor.offsets()
+            seq_lengths = offsets.diff()
+            max_seq_len = int(seq_lengths.max().item())
+            input_ids_padded = torch.zeros(
+                (batch_size, max_seq_len), dtype=input_ids_tensor.values().dtype, device=input_ids_tensor.device
+            )
+            attn_mask_padded = torch.zeros((batch_size, max_seq_len), dtype=torch.int32, device=input_ids_tensor.device)
+            for i in range(batch_size):
+                seq_len = int(seq_lengths[i].item())
+                start = int(offsets[i].item())
+                input_ids_padded[i, :seq_len] = input_ids_tensor.values()[start : start + seq_len]
+                attn_mask_padded[i, :seq_len] = 1
+        else:
+            input_ids_padded = input_ids_tensor
+            attn_mask_padded = attention_mask_tensor
+
+        tree_data = {
+            "input_ids": input_ids_padded,
+            "attention_mask": attn_mask_padded,
+        }
+
+        tree_batch = build_packed_tree_batch(
+            data=tree_data,
+            max_tokens_per_tree=self.engine_config.tree_max_tokens_per_tree,
+            pad_to_maximum=True,
+            dp_group=self.get_data_parallel_group(),
+            parallel_size=1,
+        )
+
+        logger.info(
+            f"Tree training: #microbatches={len(tree_batch)}, "
+            f"group_lens={tree_batch.group_lens}, "
+            f"tree_token_ratio={tree_batch.tree_token_ratio:.4f}"
+        )
+
+        device = get_device_id()
+        device_name = get_device_name()
+        ctx = torch.no_grad() if forward_only else nullcontext()
+
+        output_lst = []
+
+        for mb_item in tree_batch:
+            assert isinstance(mb_item, TreeMicroBatchItem)
+
+            input_ids = mb_item.input_ids.to(device)
+            position_ids = mb_item.position_ids.to(device)
+            trie_node = mb_item.trie_node
+            padded_size = mb_item.padded_to_length
+
+            model_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": None,
+                "position_ids": position_ids,
+            }
+
+            tree_attn_keys: list[str] = []
+            if trie_node is not None and trie_node.all_sequence_ids:
+                tree_kwargs = build_tree_attn_kwargs(trie_node, padded_size, input_ids.device)
+                model_inputs.update(tree_kwargs)
+                tree_attn_keys = list(tree_kwargs.keys())
+
+            with ctx:
+                with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+                    raw_output = self.module(
+                        **model_inputs,
+                        use_cache=False,
+                    )
+                    logits = raw_output.logits.squeeze(0)
+
+                    for key in tree_attn_keys:
+                        del model_inputs[key]
+
+                    if trie_node is None or not trie_node.all_sequence_ids:
+                        loss = logits.sum() * 0.0
+                        output_lst.append(
+                            {
+                                "loss": loss.detach().item(),
+                                "metrics": {},
+                            }
+                        )
+                        if not forward_only and loss is not None:
+                            loss.backward()
+                        continue
+
+                    temperature = tu.get_non_tensor_data(data=data, key="temperature", default=1.0)
+                    if isinstance(temperature, torch.Tensor):
+                        temperature = temperature.float().mean().item()
+
+                    logprobs, entropy = gather_packed_tree_logprobs_entropy(
+                        logits, trie_node, input_ids, temperature=temperature
+                    )
+
+                    all_seq_ids = trie_node.all_sequence_ids
+                    seq_logprobs = []
+                    cursor = 0
+                    for sid in all_seq_ids:
+                        indices = trie_node.get_sequence_tree_indices(sid)
+                        seq_len = sum(end - start + 1 for start, end in indices)
+                        num_lp = seq_len - 1
+                        seq_logprobs.append(logprobs[cursor : cursor + num_lp])
+                        cursor += num_lp
+
+                    all_seq_entropy = []
+                    cursor = 0
+                    for sid in all_seq_ids:
+                        indices = trie_node.get_sequence_tree_indices(sid)
+                        seq_len = sum(end - start + 1 for start, end in indices)
+                        num_ent = seq_len - 1
+                        all_seq_entropy.append(entropy[cursor : cursor + num_ent])
+                        cursor += num_ent
+
+                    log_probs_nested = torch.nested.as_nested_tensor(seq_logprobs, layout=torch.jagged)
+                    entropy_nested = torch.nested.as_nested_tensor(all_seq_entropy, layout=torch.jagged)
+
+                    tree_micro_batch = data.clone()
+                    if len(all_seq_ids) <= tree_micro_batch.batch_size[0]:
+                        seq_indices = list(all_seq_ids)
+                        tree_micro_batch = tree_micro_batch[seq_indices]
+
+                    model_output = {
+                        "log_probs": log_probs_nested,
+                        "entropy": entropy_nested,
+                    }
+
+                    if loss_function is not None:
+                        loss, metrics = loss_function(
+                            model_output=model_output,
+                            data=tree_micro_batch,
+                            dp_group=self.get_data_parallel_group(),
+                        )
+                    else:
+                        assert forward_only, "forward_only must be True when loss_function is None"
+                        loss = torch.tensor(1.0, device=device_name)
+                        metrics = {}
+
+                    if not forward_only and loss is not None:
+                        loss.backward()
+
+                    output_lst.append(
+                        {
+                            "model_output": model_output,
+                            "loss": loss.detach().item(),
+                            "metrics": metrics,
+                        }
+                    )
+
+        model_output_combined = {}
+        losses = []
+        aggregated_metrics = {}
+
+        for o in output_lst:
+            if "model_output" in o:
+                for key, val in o["model_output"].items():
+                    if key not in model_output_combined:
+                        model_output_combined[key] = []
+                    model_output_combined[key].append(val)
+
+        for key, val_list in model_output_combined.items():
+            tensors = [tensor for nt in val_list for tensor in nt.unbind()]
+            model_output_combined[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+
+        for o in output_lst:
+            if "loss" in o:
+                losses.append(o["loss"])
+
+        for o in output_lst:
+            if "metrics" in o:
+                from verl.utils.py_functional import append_to_dict
+
+                append_to_dict(aggregated_metrics, o["metrics"])
+
+        output = {
+            "model_output": model_output_combined,
+            "loss": losses,
+            "metrics": aggregated_metrics,
+        }
+
+        return output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
