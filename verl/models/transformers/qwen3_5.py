@@ -185,6 +185,8 @@ def forward_with_normal_backend(
     temperature: float = 1.0,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
+    print("kwargs:", kwargs.keys())
+    print("input_ids", input_ids.shape)
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
     logits = self.lm_head(hidden_states)

@@ -5,6 +5,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from typing import Any
+import hashlib
 
 import torch
 import torch.distributed as dist
@@ -174,18 +175,47 @@ def trie_to_parent_array(trie: TrieNode, max_tokens: int) -> torch.Tensor:
 
     return fa
 
+def _hash_multimodal_value(value: Any) -> str:
+    if value is None:
+        return "none"
+    if hasattr(value, "data") and not isinstance(value, torch.Tensor):
+        value = value.data
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().contiguous()
+        h = hashlib.blake2b(digest_size=16)
+        h.update(str(value.dtype).encode())
+        h.update(str(tuple(value.shape)).encode())
+        h.update(value.numpy().tobytes())
+        return h.hexdigest()
+    if isinstance(value, dict):
+        return "{" + "|".join(f"{k}:{_hash_multimodal_value(value[k])}" for k in sorted(value)) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + "|".join(_hash_multimodal_value(v) for v in value) + "]"
+    return repr(value)
+
+
+def _extract_multimodal_signatures(data: dict[str, Any]) -> list[str] | None:
+    if "multi_modal_inputs" not in data:
+        return None
+    return [_hash_multimodal_value(item) for item in data["multi_modal_inputs"]]
+
+
 
 def _greedy_build_tries(
     data: dict[str, Any],
     max_tokens_per_tree: int,
 ) -> tuple[list[TrieNode], list[int]]:
+    signatures = _extract_multimodal_signatures(data)
     sequences = _extract_sequences(data)
     forests: list[dict[str, Any]] = []
 
     for seq_id, seq in enumerate(sequences):
         inserted = False
+        signature = signatures[seq_id] if signatures is not None else None
 
         for tree_id, tree in enumerate(forests):
+            if tree["signature"] != signature:
+                continue
             additional = _count_additional_nodes(tree["root"], seq)
             if tree["nodes"] + additional <= max_tokens_per_tree:
                 _insert_sequence(
@@ -212,7 +242,9 @@ def _greedy_build_tries(
         new_root = _BuildNode(new_tree_id, -1, -1)
         all_nodes: list[_BuildNode] = []
         _insert_sequence(new_root, all_nodes, seq, new_tree_id, seq_id)
-        forests.append({"root": new_root, "all_nodes": all_nodes, "nodes": len(seq)})
+        forests.append({"root": new_root, "all_nodes": all_nodes, "nodes": len(seq), "signature": signature})
+
+        # forests.append({"root": new_root, "all_nodes": all_nodes, "nodes": len(seq)})
 
     tries = [_compress_trie(f["root"]) for f in forests]
     num_tokens_list = [f["nodes"] for f in forests]
@@ -239,11 +271,12 @@ def _pack_input_ids(
     input_template: torch.Tensor,
     max_tokens: int,
 ) -> torch.Tensor:
-    input_ids = torch.zeros(
-        (max_tokens,),
-        dtype=input_template.dtype,
-        device=input_template.device,
-    )
+    # input_ids = torch.zeros(
+    #     (max_tokens,),
+    #     dtype=input_template.dtype,
+    #     device=input_template.device,
+    # )
+    input_ids = torch.zeros((max_tokens,), dtype=input_template.dtype, device=input_template.device)
 
     for node in trie.nodes:
         seq_id = node.sequence_ids[0]
@@ -252,6 +285,25 @@ def _pack_input_ids(
         input_ids[tree_start : tree_end + 1] = input_template[seq_id][seq_pos : seq_pos + node.num_tokens]
 
     return input_ids.unsqueeze(0)
+
+def _pack_position_ids(trie: TrieNode, position_template: torch.Tensor, max_tokens: int) -> torch.Tensor:
+    if position_template.dim() == 2:
+        packed = torch.zeros((1, max_tokens), dtype=position_template.dtype, device=position_template.device)
+        for node in trie.nodes:
+            seq_id = node.sequence_ids[0]
+            seq_pos = sum(ancestor.num_tokens for ancestor in node.ancestors)
+            tree_start, tree_end = node.tree_indices
+            packed[0, tree_start : tree_end + 1] = position_template[seq_id, seq_pos : seq_pos + node.num_tokens]
+        return packed
+    if position_template.dim() == 3:
+        packed = torch.zeros((position_template.shape[1], 1, max_tokens), dtype=position_template.dtype, device=position_template.device)
+        for node in trie.nodes:
+            seq_id = node.sequence_ids[0]
+            seq_pos = sum(ancestor.num_tokens for ancestor in node.ancestors)
+            tree_start, tree_end = node.tree_indices
+            packed[:, 0, tree_start : tree_end + 1] = position_template[seq_id, :, seq_pos : seq_pos + node.num_tokens]
+        return packed
+    raise ValueError(f"Unsupported packed position_ids shape: {tuple(position_template.shape)}")
 
 
 _ATTN_MASK_BLOCK_SIZE = 2048
@@ -480,6 +532,7 @@ def build_packed_tree_batch(
 
     input_template: torch.Tensor = data["input_ids"]
     mask_template: torch.Tensor = data["attention_mask"]
+    position_template: torch.Tensor | None = data.get("position_ids")
 
     original_num_tokens = mask_template.sum()
     total_tree_tokens = sum(num_tokens_list)
@@ -490,9 +543,13 @@ def build_packed_tree_batch(
     packable_keys = {
         key
         for key, value in data.items()
-        if key not in {"input_ids", "attention_mask"} and torch.is_tensor(value) and value.shape == input_template.shape
+        if key not in {"input_ids", "attention_mask", "position_ids"}
+        and torch.is_tensor(value)
+        and value.shape == input_template.shape
     }
-    non_packable_keys = set(data.keys()) - packable_keys - {"input_ids", "attention_mask"}
+
+    # non_packable_keys = set(data.keys()) - packable_keys - {"input_ids", "attention_mask"}
+    non_packable_keys = set(data.keys()) - packable_keys - {"input_ids", "attention_mask", "position_ids"}
 
     items: list[TreeMicroBatchItem] = []
     padding_lengths: list[int] = []
@@ -503,12 +560,18 @@ def build_packed_tree_batch(
 
         input_ids = _pack_input_ids(trie, input_template, padded_size)
 
-        attention_mask = _build_attention_mask(trie, padded_size, mask_template.device)
+        # attention_mask = _build_attention_mask(trie, padded_size, mask_template.device)
 
-        position_ids = get_packed_tree_position_ids(input_ids, attention_mask)
+        # position_ids = get_packed_tree_position_ids(input_ids, attention_mask)
 
-        del attention_mask
+        # del attention_mask
 
+        if position_template is not None:
+            position_ids = _pack_position_ids(trie, position_template, padded_size)
+        else:
+            attention_mask = _build_attention_mask(trie, padded_size, mask_template.device)
+            position_ids = get_packed_tree_position_ids(input_ids, attention_mask)
+            del attention_mask
         extra_data = _pack_extra_data(trie, data, sequence_lens, packable_keys, non_packable_keys)
 
         item = TreeMicroBatchItem(

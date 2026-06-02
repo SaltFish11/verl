@@ -27,7 +27,6 @@ _flex_attention = torch.compile(
     options=_TORCH_COMPILE_OPTIONS,
 )
 
-
 def create_block_mask_from_dense(
     attention_mask: torch.Tensor,
     seq_len: int,
@@ -62,15 +61,32 @@ def _tree_attn_fwd_func(
     softmax_scale: float | None = None,
     *args,
     **kwargs,
-):
-    tree_block_mask = kwargs.get("tree_block_mask", None)
-    if tree_block_mask is None or not isinstance(tree_block_mask, BlockMask):
-        raise ValueError(
-            "_tree_attn_fwd_func requires a pre-created BlockMask in "
-            "kwargs['tree_block_mask']. "
-            "Use create_block_mask_from_dense() during data preparation."
-        )
+):  
+    # print("tree attn fwd func:",kwargs.keys())
+    tree_block_mask = kwargs.pop("tree_block_mask", None)
+    # if tree_block_mask is None:
+    #     # Fallback: 从 thread-local 取（backward 重计算时走这条路径）
+    #     tree_block_mask = getattr(_TREE_ATTN_CTX, "block_mask", None)
 
+    if tree_block_mask is None or not isinstance(tree_block_mask, BlockMask):
+        # raise ValueError(
+        #     "_tree_attn_fwd_func requires a pre-created BlockMask in "
+        #     "kwargs['tree_block_mask']. "
+        #     "Use create_block_mask_from_dense() during data preparation."
+        # )
+        if ORIGINAL_FLASH_ATTENTION_FORWARD is None:
+            raise ValueError(
+                "tree attention patch is active but ORIGINAL_FLASH_ATTENTION_FORWARD is missing"
+            )
+        return ORIGINAL_FLASH_ATTENTION_FORWARD(
+            query,
+            key,
+            value,
+            attention_mask,
+            *args,
+            softmax_scale=softmax_scale,
+            **kwargs,
+        )
     query = query.permute(0, 2, 1, 3).contiguous()
     key = key.permute(0, 2, 1, 3).contiguous()
     value = value.permute(0, 2, 1, 3).contiguous()
@@ -106,7 +122,7 @@ def patch_fsdp_for_tree_training(enable: bool = True):
 
     ORIGINAL_FLASH_ATTENTION_FORWARD = flash_attention._flash_attention_forward
     flash_attention._flash_attention_forward = _tree_attn_fwd_func
-    logger.info("Patched transformers.integrations.flash_attention._flash_attention_forward with tree implementation.")
+    print(f"Patched transformers.integrations.flash_attention._flash_attention_forward with tree implementation, and this can't use ulysses_sp")
 
 
 def restore_patch_fsdp_for_tree_training():

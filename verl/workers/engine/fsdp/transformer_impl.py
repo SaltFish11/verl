@@ -21,6 +21,7 @@ import os
 import warnings
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional
+from tensordict.tensorclass import NonTensorData
 
 import torch
 import torch.distributed
@@ -29,6 +30,7 @@ from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.tensor import DTensor
+from verl.utils.metric.utils import Metric
 
 import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
@@ -289,14 +291,16 @@ class FSDPEngine(BaseEngine):
                 fused_kernels_backend=fused_kernels_backend,
             )
 
-            if self.engine_config.enable_tree_training:
+            self.enable_tree_training = True
+            if self.enable_tree_training :
+                if self.ulysses_sequence_parallel_size > 1:
+                    raise ValueError("Tree training is not supported with ulysses_sp")
                 from verl.models.tree_attn.module_fsdp import patch_fsdp_for_tree_training
-
+                # print("tree patch begine")
                 patch_fsdp_for_tree_training(enable=True)
 
             # some parameters may not in torch_dtype
             module.to(torch_dtype)
-
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         return module
@@ -1228,7 +1232,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return model_output
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
-        if not self.engine_config.enable_tree_training:
+        if not self.enable_tree_training:
             return super().forward_backward_batch(data, loss_function, forward_only)
 
         return self._forward_backward_batch_tree(data, loss_function, forward_only)
@@ -1250,6 +1254,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         input_ids_tensor = data["input_ids"]
         attention_mask_tensor = data["attention_mask"]
+        position_ids_tensor = data["position_ids"]
+        multi_modal_inputs = data.get("multi_modal_inputs", None)
+        has_multi_modal_inputs = multi_modal_inputs is not None and len(multi_modal_inputs) > 0
+        print("input_ids_tensor:", input_ids_tensor.shape)
+        print("multi_modal_inputs:", len(multi_modal_inputs))
         if hasattr(input_ids_tensor, "values"):
             batch_size = input_ids_tensor.size(0)
             offsets = input_ids_tensor.offsets()
@@ -1264,15 +1273,37 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 start = int(offsets[i].item())
                 input_ids_padded[i, :seq_len] = input_ids_tensor.values()[start : start + seq_len]
                 attn_mask_padded[i, :seq_len] = 1
+            if hasattr(position_ids_tensor, "values"):
+                pos_items = list(position_ids_tensor.unbind())
+                if position_ids_tensor.dim() == 3:
+                    num_axes = pos_items[0].shape[0]
+                    position_ids_padded = torch.zeros(
+                        (batch_size, num_axes, max_seq_len), dtype=position_ids_tensor.values().dtype, device=position_ids_tensor.device
+                    )
+                    for i, pos in enumerate(pos_items):
+                        position_ids_padded[i, :, : pos.shape[-1]] = pos
+                else:
+                    position_ids_padded = torch.zeros(
+                        (batch_size, max_seq_len), dtype=position_ids_tensor.values().dtype, device=position_ids_tensor.device
+                    )
+                    for i, pos in enumerate(pos_items):
+                        position_ids_padded[i, : pos.shape[-1]] = pos
+            else:
+                position_ids_padded = position_ids_tensor
         else:
             input_ids_padded = input_ids_tensor
             attn_mask_padded = attention_mask_tensor
+            position_ids_padded = position_ids_tensor.transpose(0, 1) if position_ids_tensor.dim() == 3 and position_ids_tensor.shape[0] != input_ids_tensor.shape[0] else position_ids_tensor
+
 
         tree_data = {
             "input_ids": input_ids_padded,
             "attention_mask": attn_mask_padded,
-        }
+            "position_ids": position_ids_padded,
 
+        }
+        if has_multi_modal_inputs:
+            tree_data["multi_modal_inputs"] = multi_modal_inputs
         tree_batch = build_packed_tree_batch(
             data=tree_data,
             max_tokens_per_tree=self.engine_config.tree_max_tokens_per_tree,
@@ -1281,7 +1312,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             parallel_size=1,
         )
 
-        logger.info(
+        print(
             f"Tree training: #microbatches={len(tree_batch)}, "
             f"group_lens={tree_batch.group_lens}, "
             f"tree_token_ratio={tree_batch.tree_token_ratio:.4f}"
@@ -1300,18 +1331,45 @@ class FSDPEngineWithLMHead(FSDPEngine):
             position_ids = mb_item.position_ids.to(device)
             trie_node = mb_item.trie_node
             padded_size = mb_item.padded_to_length
+            all_seq_ids = trie_node.all_sequence_ids if trie_node is not None else []
 
             model_inputs = {
                 "input_ids": input_ids,
                 "attention_mask": None,
                 "position_ids": position_ids,
             }
+            if all_seq_ids and has_multi_modal_inputs:
+                model_inputs.update(extract_multi_modal_inputs(multi_modal_inputs, indices=[all_seq_ids[0]]))
 
-            tree_attn_keys: list[str] = []
-            if trie_node is not None and trie_node.all_sequence_ids:
+            # tree_attn_keys: list[str] = []
+            # if trie_node is not None and trie_node.all_sequence_ids:
+            #     tree_kwargs = build_tree_attn_kwargs(trie_node, padded_size, input_ids.device)
+            #     # print("input_ids:",input_ids.shape)
+
+            #     model_inputs.update(tree_kwargs)
+            #     # print("tree_kwargs:",tree_kwargs.keys())
+                
+            #     tree_attn_keys = list(tree_kwargs.keys())
+            # else:
+            #     from verl.models.tree_attn.module_fsdp import create_block_mask_from_dense
+            #     # print("fuck error")
+            #     # print("input_ids:",input_ids.shape)
+            #     causal_mask = torch.tril(
+            #         torch.ones(padded_size, padded_size, dtype=torch.bool, device=input_ids.device)
+            #     )
+            #     tree_kwargs = {"tree_block_mask": create_block_mask_from_dense(causal_mask, padded_size, input_ids.device)}
+            if all_seq_ids:
                 tree_kwargs = build_tree_attn_kwargs(trie_node, padded_size, input_ids.device)
+            else:
+                from verl.models.tree_attn.module_fsdp import create_block_mask_from_dense
+
+                causal_mask = torch.tril(
+                    torch.ones(padded_size, padded_size, dtype=torch.bool, device=input_ids.device)
+                )
+                tree_kwargs = {"tree_block_mask": create_block_mask_from_dense(causal_mask, padded_size, input_ids.device)}
                 model_inputs.update(tree_kwargs)
-                tree_attn_keys = list(tree_kwargs.keys())
+                model_inputs.update(tree_kwargs)
+            model_inputs.update(tree_kwargs)
 
             with ctx:
                 with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
@@ -1320,9 +1378,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         use_cache=False,
                     )
                     logits = raw_output.logits.squeeze(0)
+                    
 
-                    for key in tree_attn_keys:
-                        del model_inputs[key]
+                    # for key in tree_attn_keys:
+                    #     del model_inputs[key]
 
                     if trie_node is None or not trie_node.all_sequence_ids:
                         loss = logits.sum() * 0.0
@@ -1337,44 +1396,79 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         continue
 
                     temperature = tu.get_non_tensor_data(data=data, key="temperature", default=1.0)
+                    calculate_entropy = tu.get_non_tensor_data(data=data, key="calculate_entropy", default=False)
+
                     if isinstance(temperature, torch.Tensor):
                         temperature = temperature.float().mean().item()
-
+                    # [unpack_tree_seq_len]
                     logprobs, entropy = gather_packed_tree_logprobs_entropy(
                         logits, trie_node, input_ids, temperature=temperature
                     )
-
-                    all_seq_ids = trie_node.all_sequence_ids
+                    if not calculate_entropy:
+                        entropy = None
+                    # all_seq_ids = trie_node.all_sequence_ids
+                    # print("input_ids:",input_ids.shape)
+                    # print("logits:", logits.shape)
+                    # print("entropy:",entropy.shape)
+                    # print("all_seq_ids:",all_seq_ids)
                     seq_logprobs = []
                     cursor = 0
                     for sid in all_seq_ids:
                         indices = trie_node.get_sequence_tree_indices(sid)
                         seq_len = sum(end - start + 1 for start, end in indices)
-                        num_lp = seq_len - 1
-                        seq_logprobs.append(logprobs[cursor : cursor + num_lp])
-                        cursor += num_lp
+                        seq_logprobs.append(logprobs[cursor : cursor + seq_len])
+                        cursor += seq_len
 
-                    all_seq_entropy = []
-                    cursor = 0
-                    for sid in all_seq_ids:
-                        indices = trie_node.get_sequence_tree_indices(sid)
-                        seq_len = sum(end - start + 1 for start, end in indices)
-                        num_ent = seq_len - 1
-                        all_seq_entropy.append(entropy[cursor : cursor + num_ent])
-                        cursor += num_ent
+                    # all_seq_entropy = []
+                    # cursor = 0
+                    # for sid in all_seq_ids:
+                    #     indices = trie_node.get_sequence_tree_indices(sid)
+                    #     seq_len = sum(end - start + 1 for start, end in indices)
+                    #     all_seq_entropy.append(entropy[cursor : cursor + seq_len])
+                    #     cursor += seq_len
+                    entropy_nested = None
+                    if entropy is not None:
+                        all_seq_entropy = []
+                        cursor = 0
+                        for sid in all_seq_ids:
+                            indices = trie_node.get_sequence_tree_indices(sid)
+                            seq_len = sum(end - start + 1 for start, end in indices)
+                            all_seq_entropy.append(entropy[cursor : cursor + seq_len])
+                            cursor += seq_len
+                        entropy_nested = torch.nested.as_nested_tensor(all_seq_entropy, layout=torch.jagged)
 
                     log_probs_nested = torch.nested.as_nested_tensor(seq_logprobs, layout=torch.jagged)
-                    entropy_nested = torch.nested.as_nested_tensor(all_seq_entropy, layout=torch.jagged)
+                    # entropy_nested = torch.nested.as_nested_tensor(all_seq_entropy, layout=torch.jagged)
 
                     tree_micro_batch = data.clone()
                     if len(all_seq_ids) <= tree_micro_batch.batch_size[0]:
                         seq_indices = list(all_seq_ids)
-                        tree_micro_batch = tree_micro_batch[seq_indices]
-
+                        # tree_micro_batch = tree_micro_batch[seq_indices]
+                        new_fields = {}
+                        for key in tree_micro_batch.keys():
+                            val = tree_micro_batch[key]
+                            
+                            if isinstance(val, torch.Tensor) and val.is_nested:
+                                unbound = val.unbind()
+                                new_fields[key] = torch.nested.as_nested_tensor(
+                                    [unbound[i] for i in seq_indices], layout=torch.jagged
+                                )
+                            elif isinstance(val, torch.Tensor):
+                                new_fields[key] = val[seq_indices]
+                            else:
+                                try:
+                                    new_fields[key] = val[seq_indices]
+                                except TypeError:
+                                    new_fields[key] = NonTensorData(val, batch_size=[len(seq_indices)])
+                        tree_micro_batch = TensorDict(
+                            new_fields, batch_size=[len(seq_indices)]
+                        )
                     model_output = {
                         "log_probs": log_probs_nested,
-                        "entropy": entropy_nested,
+                        # "entropy": entropy_nested,
                     }
+                    if entropy_nested is not None:
+                        model_output["entropy"] = entropy_nested
 
                     if loss_function is not None:
                         loss, metrics = loss_function(
@@ -1386,9 +1480,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         assert forward_only, "forward_only must be True when loss_function is None"
                         loss = torch.tensor(1.0, device=device_name)
                         metrics = {}
-
+                    # print("forward steploss:",loss.shape)
                     if not forward_only and loss is not None:
                         loss.backward()
+
+
 
                     output_lst.append(
                         {
@@ -1400,7 +1496,24 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         model_output_combined = {}
         losses = []
-        aggregated_metrics = {}
+        real_group_lens = [group_len for group_len in tree_batch.group_lens if group_len > 0]
+        real_tree_count = len(real_group_lens)
+        total_tree_count = len(tree_batch.group_lens)
+        dummy_tree_ratio = (total_tree_count - real_tree_count) / total_tree_count if total_tree_count > 0 else 0.0
+        avg_tokens_per_tree = sum(real_group_lens) / real_tree_count if real_tree_count > 0 else 0.0
+        min_tokens_per_tree = min(real_group_lens) if real_group_lens else 0.0
+        max_tokens_per_tree = max(real_group_lens) if real_group_lens else 0.0
+        aggregated_metrics = {
+            "perf/tree_attn/token_ratio": Metric(aggregation="mean", value=tree_batch.tree_token_ratio),
+            "perf/tree_attn/token_reduction_ratio": Metric(
+                aggregation="mean", value=1.0 - tree_batch.tree_token_ratio
+            ),
+            "perf/tree_attn/num_microbatches": Metric(aggregation="mean", value=total_tree_count),
+            "perf/tree_attn/dummy_microbatch_ratio": Metric(aggregation="mean", value=dummy_tree_ratio),
+            "perf/tree_attn/avg_tokens_per_tree": Metric(aggregation="mean", value=avg_tokens_per_tree),
+            "perf/tree_attn/min_tokens_per_tree": Metric(aggregation="mean", value=min_tokens_per_tree),
+            "perf/tree_attn/max_tokens_per_tree": Metric(aggregation="mean", value=max_tokens_per_tree),
+        }
 
         for o in output_lst:
             if "model_output" in o:
@@ -1422,13 +1535,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 from verl.utils.py_functional import append_to_dict
 
                 append_to_dict(aggregated_metrics, o["metrics"])
+        for key, val in aggregated_metrics.items():
+            if isinstance(val, Metric):
+                aggregated_metrics[key] = Metric(aggregation=val.aggregation, value=val.aggregate())
 
         output = {
             "model_output": model_output_combined,
             "loss": losses,
             "metrics": aggregated_metrics,
         }
-
+        print("micro batch forward-backward step end")
         return output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):

@@ -1170,6 +1170,7 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
             batch_num_tokens = loss_mask.sum()
+        
         loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
     elif loss_agg_mode in ["seq-mean-token-sum", "seq-mean-token-sum-norm"]:
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
@@ -1325,12 +1326,16 @@ def compute_policy_loss_vanilla(
         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
         + f" but get the value: {clip_ratio_c}."
     )
-
+    print("log_prob:",log_prob.shape, " device:", log_prob.device)
+    print("old_log_prob:",old_log_prob.shape," device:", old_log_prob.device)
+    old_log_prob = old_log_prob.to(log_prob.device)
     negative_approx_kl = log_prob - old_log_prob
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
+    response_mask = response_mask.to(log_prob.device)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    advantages = advantages.to(log_prob.device)
 
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:

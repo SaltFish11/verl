@@ -1382,6 +1382,11 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+                # print("batch_dict:",batch_dict.keys())
+                # print("batch_dict:",batch_dict)
+                # print("batch_dict:",batch_dict["images"])
+
+
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
